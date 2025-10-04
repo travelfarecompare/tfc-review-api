@@ -5,3 +5,4 @@ beautifulsoup4==4.12.3
 readability-lxml==0.8.1
 tldextract==5.1.2
 python-dotenv==1.0.1
+lxml_html_clean==0.1.1
