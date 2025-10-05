@@ -1,93 +1,96 @@
 import os
-import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict
+import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from bs4 import BeautifulSoup
 from readability import Document
 import tldextract
+import re
+
+app = Flask(_name_)
+CORS(app)
 
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
+MAX_RESULTS = 12
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
 
-app = FastAPI(title="Google Reviews API (via Serper.dev)")
+def clean_text(text):
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:300]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN] if ALLOWED_ORIGIN != "" else [""],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-def clean_text(text: str) -> str:
-    import re
-    txt = re.sub(r"\s+", " ", text).strip()
-    return txt[:300]
-
-def domain_logo(url: str) -> str:
+def domain_logo(url):
     dom = tldextract.extract(url)
     domain = ".".join([dom.domain, dom.suffix])
     return f"https://www.google.com/s2/favicons?sz=64&domain={domain}"
 
-async def fetch_excerpt(client: httpx.AsyncClient, url: str) -> str:
+def fetch_excerpt(url):
     try:
-        r = await client.get(url, timeout=12)
+        r = requests.get(url, timeout=12, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
         doc = Document(r.text)
         html = doc.summary()
         soup = BeautifulSoup(html, "html.parser")
         for p in soup.select("p"):
-            line = clean_text(p.get_text(strip=True))
+            line = clean_text(p.get_text())
             if len(line) > 60:
                 return line
     except Exception:
-        pass
+        return ""
     return ""
 
-@app.get("/reviews")
-async def get_reviews(title: str, n: int = 10):
+@app.route("/reviews")
+def reviews():
+    title = request.args.get("title", "").strip()
+    n = int(request.args.get("n", 6))
+
     if not title:
-        raise HTTPException(status_code=400, detail="Missing title")
+        return jsonify({"error": "Missing title"}), 400
 
     if not SERPER_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing SERPER_API_KEY")
+        return jsonify({"error": "Missing SERPER_API_KEY"}), 500
 
-    headers = {"X-API-KEY": SERPER_API_KEY}
-    payload = {"q": f"{title} review", "num": max(10, n * 3)}
-    results = []
+    headers = {
+        "X-API-KEY": SERPER_API_KEY,
+        "Content-Type": "application/json",
+    }
 
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.post("https://google.serper.dev/search", headers=headers, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            organic = data.get("organic", [])
-            seen = set()
+    payload = {
+        "q": f"{title} review",
+        "num": max(10, n * 3)
+    }
 
-            for item in organic:
-                url = item.get("link")
-                name = item.get("title") or url
-                if not url or not name:
-                    continue
-                root = tldextract.extract(url)
-                root = ".".join([root.domain, root.suffix])
-                if root in seen:
-                    continue
-                seen.add(root)
-                excerpt = await fetch_excerpt(client, url)
-                if excerpt:
-                    results.append({
-                        "url": url,
-                        "name": name,
-                        "excerpt": excerpt,
-                        "logo": domain_logo(url),
-                        "score": ""
-                    })
-                if len(results) >= n:
-                    break
+    try:
+        res = requests.post("https://google.serper.dev/search", headers=headers, json=payload, timeout=25)
+        res.raise_for_status()
+        data = res.json()
+        results = []
 
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Serper fetch failed: {str(e)}")
+        seen = set()
+        for item in data.get("organic", []):
+            url = item.get("link")
+            name = item.get("title") or url
+            if not url or not name:
+                continue
 
-    return {"title": title, "items": results}
+            dom = tldextract.extract(url)
+            root = ".".join([dom.domain, dom.suffix])
+            if root in seen:
+                continue
+            seen.add(root)
+
+            excerpt = fetch_excerpt(url)
+            if excerpt:
+                results.append({
+                    "url": url,
+                    "name": name,
+                    "excerpt": excerpt,
+                    "logo": domain_logo(url),
+                    "score": ""
+                })
+
+            if len(results) >= n:
+                break
+
+        return jsonify({"title": title, "items": results})
+    except Exception as e:
+        return jsonify({"error": f"Fetch failed: {str(e)}"}), 500
