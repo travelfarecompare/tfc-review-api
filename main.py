@@ -135,8 +135,12 @@ def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
             .get("content", "")
             .strip()
         )
-        parsed = json.loads(content or "{}")
-        links = parsed.get("links", [])
+       try:
+    parsed = json.loads(content or "{}")
+    links = parsed.get("links", [])
+except json.JSONDecodeError as e:
+    print(f"OpenAI response is not valid JSON: {content}")
+    raise RuntimeError("ChatGPT returned invalid JSON. Try a more popular topic.")
         out = []
         for it in links:
             url = (it.get("url") or "").strip()
