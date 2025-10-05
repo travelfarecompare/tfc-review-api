@@ -7,14 +7,11 @@ from bs4 import BeautifulSoup
 from readability import Document
 import tldextract
 
-app = Flask(_name_)
+app = Flask(_name_)          # ← FIXED
 CORS(app)
 
-# Prefer env var; fall back to your provided key
-SERPER_API_KEY = os.getenv(
-    "SERPER_API_KEY",
-    "bf878008033cf77401339961b95a21f9dc3567b4"
-)
+# Prefer env var; fall back to your provided key (you can remove the default if you want)
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "bf878008033cf77401339961b95a21f9dc3567b4")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -27,8 +24,8 @@ def clean_text(text: str) -> str:
     return text[:300]
 
 def domain_logo(url: str) -> str:
-    dom = tldextract.extract(url)
-    domain = ".".join([dom.domain, dom.suffix])
+    ext = tldextract.extract(url)
+    domain = ".".join([ext.domain, ext.suffix])
     return f"https://www.google.com/s2/favicons?sz=64&domain={domain}"
 
 def fetch_excerpt(url: str) -> str:
@@ -61,7 +58,6 @@ def reviews():
 
     if not title:
         return jsonify({"error": "Missing title"}), 400
-
     if not SERPER_API_KEY:
         return jsonify({"error": "Missing SERPER_API_KEY"}), 500
 
@@ -90,7 +86,8 @@ def reviews():
         if not url or not name:
             continue
 
-        root = ".".join([tldextract.extract(url).domain, tldextract.extract(url).suffix])
+        ext = tldextract.extract(url)
+        root = ".".join([ext.domain, ext.suffix])
         if root in seen_roots:
             continue
         seen_roots.add(root)
@@ -114,7 +111,7 @@ def reviews():
 
     return jsonify({"title": title, "items": results})
 
-@app.route("/review-url")
+@app.route("/review_url")          # ← underscore to match your WP plugin
 def review_url():
     """
     Fetch one review by direct URL.
@@ -160,4 +157,8 @@ def review_url():
 
 @app.route("/health")
 def health():
-    return jsonify({'ok': True})
+    return jsonify({"ok": True})
+
+if _name_ == "_main_":        # ← makes python main.py work on Render
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
