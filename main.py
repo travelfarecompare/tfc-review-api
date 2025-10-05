@@ -34,7 +34,7 @@ USER_AGENT = (
 # -------------------------------
 # App bootstrap
 # -------------------------------
-app = Flask(_name_)
+app = Flask(__name__)
 
 # If you set ALLOWED_ORIGIN to "*" we’ll allow all; otherwise only that origin.
 if ALLOWED_ORIGIN and ALLOWED_ORIGIN != "*":
@@ -266,7 +266,7 @@ def health():
 # -------------------------------
 # Local dev entrypoint
 # -------------------------------
-if _name_ == "_main_":
+if __name__ == "__main__":
     # Local: python main.py
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
