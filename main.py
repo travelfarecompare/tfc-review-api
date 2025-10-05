@@ -33,7 +33,7 @@ USER_AGENT = (
 # -------------------------------
 # App bootstrap
 # -------------------------------
-app = Flask(_name_)
+app = Flask(__name__)
 CORS(
     app,
     resources={r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else ""}},
