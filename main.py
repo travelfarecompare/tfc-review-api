@@ -160,4 +160,4 @@ def review_url():
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({'ok': True})
