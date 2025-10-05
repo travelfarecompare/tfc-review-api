@@ -1,3 +1,4 @@
+# main.py
 import os
 import re
 import json
@@ -10,7 +11,7 @@ from bs4 import BeautifulSoup
 from readability import Document
 import tldextract
 
-# Optional: load .env locally
+# Optional: load .env locally if present (no effect on Render unless python-dotenv is installed)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -20,8 +21,8 @@ except Exception:
 # -------------------------------
 # Config
 # -------------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+OPENAI_CHAT_MODEL = (os.getenv("OPENAI_CHAT_MODEL") or "gpt-4o-mini").strip()
 ALLOWED_ORIGIN = (os.getenv("ALLOWED_ORIGIN") or "*").strip()
 
 USER_AGENT = (
@@ -34,11 +35,12 @@ USER_AGENT = (
 # App bootstrap
 # -------------------------------
 app = Flask(_name_)
-CORS(
-    app,
-    resources={r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else ""}},
-    supports_credentials=False,
-)
+
+# If you set ALLOWED_ORIGIN to "*" we’ll allow all; otherwise only that origin.
+if ALLOWED_ORIGIN and ALLOWED_ORIGIN != "*":
+    CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGIN}}, supports_credentials=False)
+else:
+    CORS(app)
 
 # -------------------------------
 # Helpers
@@ -64,7 +66,7 @@ def fetch_excerpt(url: str, timeout: int = 12) -> str:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
 
-        # Use Readability to isolate main content
+        # Use Readability to isolate main content (falls back to full HTML if needed)
         doc = Document(r.text)
         html = doc.summary() or r.text
 
@@ -95,7 +97,6 @@ def clamp(n: int, lo: int, hi: int) -> int:
 def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
     """
     Ask OpenAI to return up to n review links for the given topic.
-    We instruct it to output strict JSON.
     Returns a list of dicts: [{"url": "...", "name": "..."}]
     """
     if not OPENAI_API_KEY:
@@ -175,7 +176,7 @@ def reviews():
         return jsonify({"error": "Missing title"}), 400
 
     try:
-        candidates = ask_openai_for_links(title, n * 2)  # over-ask, then filter/dedupe
+        candidates = ask_openai_for_links(title, n * 2)  # over-ask, we will filter/dedupe
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -189,7 +190,7 @@ def reviews():
             continue
 
         root = root_domain(url)
-        if root in seen:  # de-duplicate by site
+        if root in seen:  # de-duplicate sites
             continue
 
         excerpt = fetch_excerpt(url)
