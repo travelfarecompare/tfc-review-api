@@ -1,96 +1,201 @@
 import os
 import re
+import json
 import requests
+from typing import List, Dict
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from bs4 import BeautifulSoup
 from readability import Document
 import tldextract
 
-app = Flask(_name_)          # ← FIXED
-CORS(app)
+# Optional: load .env locally (has no effect on Render unless you add python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-# Prefer env var; fall back to your provided key (you can remove the default if you want)
-SERPER_API_KEY = os.getenv("SERPER_API_KEY", "bf878008033cf77401339961b95a21f9dc3567b4")
+# -------------------------------
+# Config
+# -------------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()  # fast/cheap default
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*").strip()
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/121.0 Safari/537.36"
+    "Chrome/124.0 Safari/537.36"
 )
 
+# -------------------------------
+# App bootstrap
+# -------------------------------
+app = Flask(_name_)
+CORS(
+    app,
+    resources={r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else ""}},
+    supports_credentials=False,
+)
+
+# -------------------------------
+# Helpers
+# -------------------------------
+
 def clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
+    """Collapse whitespace, trim, and cap to ~300 chars for our excerpts."""
+    text = re.sub(r"\s+", " ", (text or "")).strip()
     return text[:300]
 
-def domain_logo(url: str) -> str:
+def root_domain(url: str) -> str:
     ext = tldextract.extract(url)
-    domain = ".".join([ext.domain, ext.suffix])
-    return f"https://www.google.com/s2/favicons?sz=64&domain={domain}"
+    return ".".join([ext.domain, ext.suffix]) if ext.suffix else ext.domain
 
-def fetch_excerpt(url: str) -> str:
-    """Pull a readable first good paragraph from the URL."""
+def domain_logo(url: str) -> str:
+    return f"https://www.google.com/s2/favicons?sz=64&domain={root_domain(url)}"
+
+def fetch_excerpt(url: str, timeout: int = 12) -> str:
+    """
+    Pull a readable first-good paragraph from the URL using readability-lxml + BeautifulSoup.
+    Returns "" on failure.
+    """
     try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": USER_AGENT})
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
+
+        # Use Readability to isolate main content
         doc = Document(r.text)
-        html = doc.summary()
+        html = doc.summary() or r.text
+
         soup = BeautifulSoup(html, "html.parser")
+
+        # Prefer non-trivial paragraph
         for p in soup.select("p"):
             line = clean_text(p.get_text())
             if len(line) > 60:
                 return line
+
+        # Fallback: meta description
+        m = soup.find("meta", attrs={"name": "description"})
+        if m and m.get("content"):
+            return clean_text(m["content"])
+
     except Exception:
         pass
+
     return ""
+
+def clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+# -------------------------------
+# OpenAI call
+# -------------------------------
+
+def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
+    """
+    Ask OpenAI to return up to n review links for the given topic.
+    We instruct it to output strict JSON.
+    Returns a list of dicts: [{"url": "...", "name": "..."}]
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY")
+
+    n = clamp(n, 1, 20)  # keep it reasonable
+    system = (
+        "You are a web research assistant. Given a topic, return high-quality, "
+        "editorial review links (articles or blog reviews) about that topic. "
+        "Avoid homepages, category hubs, booking engines, social media, and forums. "
+        "Prefer established magazines, newspapers, specialist blogs, and guides. "
+        "Output strict JSON only with the schema: "
+        '{ "links": [ { "url": "https://...", "name": "Site or Article Title" } ] } '
+        f"Return at most {n} items."
+    )
+
+    user = f"Topic: {topic}\nReturn up to {n} review links as per schema."
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_CHAT_MODEL,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                # Ensure JSON output
+                "response_format": {"type": "json_object"},
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+        parsed = json.loads(content or "{}")
+        links = parsed.get("links", [])
+        out = []
+        for it in links:
+            url = (it.get("url") or "").strip()
+            name = (it.get("name") or "").strip()
+            if url:
+                out.append({"url": url, "name": name or url})
+        return out[:n]
+    except Exception as e:
+        raise RuntimeError(f"OpenAI error: {e}")
+
+# -------------------------------
+# API Endpoints
+# -------------------------------
 
 @app.route("/reviews")
 def reviews():
     """
-    Search by title and return up to n review items.
-    Query: ?title=Eiffel+Tower&n=10
+    Build review cards by topic using OpenAI to propose links, then fetch
+    logo + excerpt for each link.
+
+    Query:
+      - title=Eiffel Tower
+      - n=10           (optional, default 10, max 20)
     """
-    title = request.args.get("title", "").strip()
+    title = (request.args.get("title") or "").strip()
     try:
-        n = int(request.args.get("n", 10))  # default 10
+        n = int(request.args.get("n", 10))
     except Exception:
         n = 10
+    n = clamp(n, 1, 20)
 
     if not title:
         return jsonify({"error": "Missing title"}), 400
-    if not SERPER_API_KEY:
-        return jsonify({"error": "Missing SERPER_API_KEY"}), 500
-
-    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
-    # Ask Serper for more than we need, then filter/dedupe and cap to n
-    payload = {"q": f"{title} review", "num": max(10, n * 3)}
 
     try:
-        res = requests.post(
-            "https://google.serper.dev/search",
-            headers=headers,
-            json=payload,
-            timeout=25,
-        )
-        res.raise_for_status()
-        data = res.json()
+        candidates = ask_openai_for_links(title, n * 2)  # over-ask, we will filter/dedupe
     except Exception as e:
-        return jsonify({"error": f"Serper fetch failed: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
     results = []
-    seen_roots = set()
+    seen = set()
 
-    for item in data.get("organic", []):
-        url = item.get("link")
-        name = item.get("title") or url
-        if not url or not name:
+    for it in candidates:
+        url = it.get("url")
+        name = it.get("name") or url
+        if not url:
             continue
 
-        ext = tldextract.extract(url)
-        root = ".".join([ext.domain, ext.suffix])
-        if root in seen_roots:
+        root = root_domain(url)
+        if root in seen:  # de-duplicate sites
             continue
-        seen_roots.add(root)
 
         excerpt = fetch_excerpt(url)
         if not excerpt:
@@ -105,36 +210,39 @@ def reviews():
                 "score": "",
             }
         )
+        seen.add(root)
 
         if len(results) >= n:
             break
 
     return jsonify({"title": title, "items": results})
 
-@app.route("/review_url")          # ← underscore to match your WP plugin
+@app.route("/review-url")
 def review_url():
     """
-    Fetch one review by direct URL.
-    Query: ?url=https://example.com/review
+    Build a single review card from a direct URL.
+
+    Query:
+      - url=https://example.com/some-review
     """
-    url = request.args.get("url", "").strip()
+    url = (request.args.get("url") or "").strip()
     if not url:
         return jsonify({"error": "Missing url"}), 400
 
     try:
         r = requests.get(url, timeout=12, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
+
         doc = Document(r.text)
-        html = doc.summary()
+        html = doc.summary() or r.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # Try to derive a nice site/page name
+        # derive a site/article name
         name = ""
         if soup.title and soup.title.string:
             name = clean_text(soup.title.string)
         if not name:
-            ext = tldextract.extract(url)
-            name = ".".join([ext.domain, ext.suffix])
+            name = root_domain(url)
 
         excerpt = ""
         for p in soup.select("p"):
@@ -153,12 +261,16 @@ def review_url():
             }
         )
     except Exception as e:
-        return jsonify({"error": f"URL fetch failed: {str(e)}"}), 500
+        return jsonify({"error": f"URL fetch failed: {e}"}), 500
 
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
 
-if _name_ == "_main_":        # ← makes python main.py work on Render
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+# -------------------------------
+# Local dev entrypoint
+# -------------------------------
+if _name_ == "_main_":
+    # Local: python main.py
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
