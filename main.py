@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from readability import Document
 import tldextract
 
-# Optional: load .env locally (has no effect on Render unless you add python-dotenv)
+# Optional: load .env locally
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -21,8 +21,8 @@ except Exception:
 # Config
 # -------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()  # fast/cheap default
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*").strip()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
+ALLOWED_ORIGIN = (os.getenv("ALLOWED_ORIGIN") or "*").strip()
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -33,7 +33,7 @@ USER_AGENT = (
 # -------------------------------
 # App bootstrap
 # -------------------------------
-app = Flask(__name__)
+app = Flask(_name_)
 CORS(
     app,
     resources={r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else ""}},
@@ -43,7 +43,6 @@ CORS(
 # -------------------------------
 # Helpers
 # -------------------------------
-
 def clean_text(text: str) -> str:
     """Collapse whitespace, trim, and cap to ~300 chars for our excerpts."""
     text = re.sub(r"\s+", " ", (text or "")).strip()
@@ -93,7 +92,6 @@ def clamp(n: int, lo: int, hi: int) -> int:
 # -------------------------------
 # OpenAI call
 # -------------------------------
-
 def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
     """
     Ask OpenAI to return up to n review links for the given topic.
@@ -113,7 +111,6 @@ def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
         '{ "links": [ { "url": "https://...", "name": "Site or Article Title" } ] } '
         f"Return at most {n} items."
     )
-
     user = f"Topic: {topic}\nReturn up to {n} review links as per schema."
 
     try:
@@ -130,7 +127,6 @@ def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                # Ensure JSON output
                 "response_format": {"type": "json_object"},
             },
             timeout=30,
@@ -158,7 +154,6 @@ def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
 # -------------------------------
 # API Endpoints
 # -------------------------------
-
 @app.route("/reviews")
 def reviews():
     """
@@ -180,7 +175,7 @@ def reviews():
         return jsonify({"error": "Missing title"}), 400
 
     try:
-        candidates = ask_openai_for_links(title, n * 2)  # over-ask, we will filter/dedupe
+        candidates = ask_openai_for_links(title, n * 2)  # over-ask, then filter/dedupe
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -194,7 +189,7 @@ def reviews():
             continue
 
         root = root_domain(url)
-        if root in seen:  # de-duplicate sites
+        if root in seen:  # de-duplicate by site
             continue
 
         excerpt = fetch_excerpt(url)
