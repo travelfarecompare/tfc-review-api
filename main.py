@@ -3,14 +3,13 @@ import re
 import json
 import requests
 from typing import List, Dict
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from bs4 import BeautifulSoup
 from readability import Document
 import tldextract
 
-# Optional: load .env locally (has no effect on Render unless python-dotenv is installed)
+# Optional: Load .env file for local dev
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -21,7 +20,7 @@ except Exception:
 # Config
 # -------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o").strip()
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*").strip()
 
 USER_AGENT = (
@@ -33,10 +32,10 @@ USER_AGENT = (
 # -------------------------------
 # App bootstrap
 # -------------------------------
-app = Flask(__name__)
+app = Flask(_name_)
 CORS(
     app,
-    resources={r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else ""}},
+    resources={r"/": {"origins": ALLOWED_ORIGIN}},
     supports_credentials=False,
 )
 
@@ -44,7 +43,6 @@ CORS(
 # Helpers
 # -------------------------------
 def clean_text(text: str) -> str:
-    """Collapse whitespace, trim, and cap to ~300 chars for our excerpts."""
     text = re.sub(r"\s+", " ", (text or "")).strip()
     return text[:300]
 
@@ -56,10 +54,6 @@ def domain_logo(url: str) -> str:
     return f"https://www.google.com/s2/favicons?sz=64&domain={root_domain(url)}"
 
 def fetch_excerpt(url: str, timeout: int = 12) -> str:
-    """
-    Pull a readable first-good paragraph from the URL using readability-lxml + BeautifulSoup.
-    Returns "" on failure.
-    """
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
@@ -67,33 +61,25 @@ def fetch_excerpt(url: str, timeout: int = 12) -> str:
         html = doc.summary() or r.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # Prefer non-trivial paragraph
         for p in soup.select("p"):
             line = clean_text(p.get_text())
             if len(line) > 60:
                 return line
 
-        # Fallback: meta description
         m = soup.find("meta", attrs={"name": "description"})
         if m and m.get("content"):
             return clean_text(m["content"])
     except Exception:
         pass
-
     return ""
 
 def clamp(n: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 # -------------------------------
-# OpenAI call
+# Ask OpenAI
 # -------------------------------
 def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
-    """
-    Ask OpenAI to return up to n review links for the given topic.
-    We instruct it to output strict JSON.
-    Returns a list of dicts: [{"url": "...", "name": "..."}]
-    """
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY")
 
@@ -135,12 +121,14 @@ def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
             .get("content", "")
             .strip()
         )
-       try:
-    parsed = json.loads(content or "{}")
-    links = parsed.get("links", [])
-except json.JSONDecodeError as e:
-    print(f"OpenAI response is not valid JSON: {content}")
-    raise RuntimeError("ChatGPT returned invalid JSON. Try a more popular topic.")
+
+        try:
+            parsed = json.loads(content or "{}")
+            links = parsed.get("links", [])
+        except json.JSONDecodeError:
+            print(f"OpenAI response is not valid JSON: {content}")
+            raise RuntimeError("ChatGPT returned invalid JSON. Try a more popular topic.")
+
         out = []
         for it in links:
             url = (it.get("url") or "").strip()
@@ -148,6 +136,7 @@ except json.JSONDecodeError as e:
             if url:
                 out.append({"url": url, "name": name or url})
         return out[:n]
+
     except Exception as e:
         raise RuntimeError(f"OpenAI error: {e}")
 
@@ -156,14 +145,6 @@ except json.JSONDecodeError as e:
 # -------------------------------
 @app.route("/reviews")
 def reviews():
-    """
-    Build review cards by topic using OpenAI to propose links, then fetch
-    logo + excerpt for each link.
-
-    Query:
-      - title=Eiffel Tower
-      - n=10
-    """
     title = (request.args.get("title") or "").strip()
     try:
         n = int(request.args.get("n", 10))
@@ -175,7 +156,7 @@ def reviews():
         return jsonify({"error": "Missing title"}), 400
 
     try:
-        candidates = ask_openai_for_links(title, n * 2)  # over-ask, filter/dedupe
+        candidates = ask_openai_for_links(title, n * 2)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -196,15 +177,13 @@ def reviews():
         if not excerpt:
             continue
 
-        results.append(
-            {
-                "url": url,
-                "name": name,
-                "excerpt": excerpt,
-                "logo": domain_logo(url),
-                "score": "",
-            }
-        )
+        results.append({
+            "url": url,
+            "name": name,
+            "excerpt": excerpt,
+            "logo": domain_logo(url),
+            "score": "",
+        })
         seen.add(root)
 
         if len(results) >= n:
@@ -214,10 +193,6 @@ def reviews():
 
 @app.route("/review-url")
 def review_url():
-    """
-    Build a single review card from a direct URL.
-    Query: ?url=https://example.com/some-review
-    """
     url = (request.args.get("url") or "").strip()
     if not url:
         return jsonify({"error": "Missing url"}), 400
@@ -243,15 +218,13 @@ def review_url():
                 excerpt = line
                 break
 
-        return jsonify(
-            {
-                "url": url,
-                "name": name,
-                "excerpt": excerpt,
-                "logo": domain_logo(url),
-                "score": "",
-            }
-        )
+        return jsonify({
+            "url": url,
+            "name": name,
+            "excerpt": excerpt,
+            "logo": domain_logo(url),
+            "score": "",
+        })
     except Exception as e:
         return jsonify({"error": f"URL fetch failed: {e}"}), 500
 
@@ -262,6 +235,6 @@ def health():
 # -------------------------------
 # Local dev entrypoint
 # -------------------------------
-if __name__ == "__main__":
+if _name_ == "_main_":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
