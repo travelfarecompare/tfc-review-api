@@ -1,4 +1,3 @@
-# main.py
 import os
 import re
 import json
@@ -11,7 +10,7 @@ from bs4 import BeautifulSoup
 from readability import Document
 import tldextract
 
-# Optional: load .env locally if present (no effect on Render unless python-dotenv is installed)
+# Optional: load .env locally (has no effect on Render unless python-dotenv is installed)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -21,9 +20,9 @@ except Exception:
 # -------------------------------
 # Config
 # -------------------------------
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-OPENAI_CHAT_MODEL = (os.getenv("OPENAI_CHAT_MODEL") or "gpt-4o-mini").strip()
-ALLOWED_ORIGIN = (os.getenv("ALLOWED_ORIGIN") or "*").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*").strip()
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -34,13 +33,12 @@ USER_AGENT = (
 # -------------------------------
 # App bootstrap
 # -------------------------------
-app = Flask(__name__)
-
-# If you set ALLOWED_ORIGIN to "*" we’ll allow all; otherwise only that origin.
-if ALLOWED_ORIGIN and ALLOWED_ORIGIN != "*":
-    CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGIN}}, supports_credentials=False)
-else:
-    CORS(app)
+app = Flask(_name_)
+CORS(
+    app,
+    resources={r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else ""}},
+    supports_credentials=False,
+)
 
 # -------------------------------
 # Helpers
@@ -65,11 +63,8 @@ def fetch_excerpt(url: str, timeout: int = 12) -> str:
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
-
-        # Use Readability to isolate main content (falls back to full HTML if needed)
         doc = Document(r.text)
         html = doc.summary() or r.text
-
         soup = BeautifulSoup(html, "html.parser")
 
         # Prefer non-trivial paragraph
@@ -82,7 +77,6 @@ def fetch_excerpt(url: str, timeout: int = 12) -> str:
         m = soup.find("meta", attrs={"name": "description"})
         if m and m.get("content"):
             return clean_text(m["content"])
-
     except Exception:
         pass
 
@@ -97,12 +91,13 @@ def clamp(n: int, lo: int, hi: int) -> int:
 def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
     """
     Ask OpenAI to return up to n review links for the given topic.
+    We instruct it to output strict JSON.
     Returns a list of dicts: [{"url": "...", "name": "..."}]
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY")
 
-    n = clamp(n, 1, 20)  # keep it reasonable
+    n = clamp(n, 1, 20)
     system = (
         "You are a web research assistant. Given a topic, return high-quality, "
         "editorial review links (articles or blog reviews) about that topic. "
@@ -163,7 +158,7 @@ def reviews():
 
     Query:
       - title=Eiffel Tower
-      - n=10           (optional, default 10, max 20)
+      - n=10
     """
     title = (request.args.get("title") or "").strip()
     try:
@@ -176,7 +171,7 @@ def reviews():
         return jsonify({"error": "Missing title"}), 400
 
     try:
-        candidates = ask_openai_for_links(title, n * 2)  # over-ask, we will filter/dedupe
+        candidates = ask_openai_for_links(title, n * 2)  # over-ask, filter/dedupe
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -190,7 +185,7 @@ def reviews():
             continue
 
         root = root_domain(url)
-        if root in seen:  # de-duplicate sites
+        if root in seen:
             continue
 
         excerpt = fetch_excerpt(url)
@@ -217,9 +212,7 @@ def reviews():
 def review_url():
     """
     Build a single review card from a direct URL.
-
-    Query:
-      - url=https://example.com/some-review
+    Query: ?url=https://example.com/some-review
     """
     url = (request.args.get("url") or "").strip()
     if not url:
@@ -233,7 +226,6 @@ def review_url():
         html = doc.summary() or r.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # derive a site/article name
         name = ""
         if soup.title and soup.title.string:
             name = clean_text(soup.title.string)
@@ -266,7 +258,6 @@ def health():
 # -------------------------------
 # Local dev entrypoint
 # -------------------------------
-if __name__ == "__main__":
-    # Local: python main.py
+if _name_ == "_main_":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port)
