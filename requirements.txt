@@ -1,7 +1,8 @@
-flask
+Flask
 flask-cors
 requests
 beautifulsoup4
 readability-lxml
 tldextract
+gunicorn
 python-dotenv
