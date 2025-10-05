@@ -5,27 +5,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict
 from bs4 import BeautifulSoup
 from readability import Document
-import re, tldextract
+import tldextract
 
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 
 app = FastAPI(title="Google Reviews API (via Serper.dev)")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN] if ALLOWED_ORIGIN != "*" else ["*"],
+    allow_origins=[ALLOWED_ORIGIN] if ALLOWED_ORIGIN != "" else [""],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def clean_text(txt: str) -> str:
-    txt = re.sub(r"\s+", " ", txt).strip()
+def clean_text(text: str) -> str:
+    import re
+    txt = re.sub(r"\s+", " ", text).strip()
     return txt[:300]
 
 def domain_logo(url: str) -> str:
-    host = tldextract.extract(url)
-    domain = ".".join(p for p in [host.domain, host.suffix] if p)
+    dom = tldextract.extract(url)
+    domain = ".".join([dom.domain, dom.suffix])
     return f"https://www.google.com/s2/favicons?sz=64&domain={domain}"
 
 async def fetch_excerpt(client: httpx.AsyncClient, url: str) -> str:
@@ -36,7 +38,7 @@ async def fetch_excerpt(client: httpx.AsyncClient, url: str) -> str:
         html = doc.summary()
         soup = BeautifulSoup(html, "html.parser")
         for p in soup.select("p"):
-            line = clean_text(p.get_text(" ", strip=True))
+            line = clean_text(p.get_text(strip=True))
             if len(line) > 60:
                 return line
     except Exception:
@@ -44,7 +46,7 @@ async def fetch_excerpt(client: httpx.AsyncClient, url: str) -> str:
     return ""
 
 @app.get("/reviews")
-async def get_reviews(title: str, n: int = 6):
+async def get_reviews(title: str, n: int = 10):
     if not title:
         raise HTTPException(status_code=400, detail="Missing title")
 
@@ -57,7 +59,7 @@ async def get_reviews(title: str, n: int = 6):
 
     async with httpx.AsyncClient() as client:
         try:
-            r = await client.post("https://google.serper.dev/search", headers=headers, json=payload, timeout=15)
+            r = await client.post("https://google.serper.dev/search", headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
             organic = data.get("organic", [])
@@ -68,8 +70,8 @@ async def get_reviews(title: str, n: int = 6):
                 name = item.get("title") or url
                 if not url or not name:
                     continue
-                ext = tldextract.extract(url)
-                root = ".".join([ext.domain, ext.suffix])
+                root = tldextract.extract(url)
+                root = ".".join([root.domain, root.suffix])
                 if root in seen:
                     continue
                 seen.add(root)
@@ -88,4 +90,4 @@ async def get_reviews(title: str, n: int = 6):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Serper fetch failed: {str(e)}")
 
-    return {"title": title, "items": results}
+    return {"title": title, "items": results}
