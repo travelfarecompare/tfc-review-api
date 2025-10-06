@@ -33,7 +33,7 @@ USER_AGENT = (
 # -------------------------------
 # App bootstrap
 # -------------------------------
-app = Flask(_name_)
+app = Flask(__name__)
 CORS(
     app,
     resources={r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else "*"},
@@ -277,7 +277,7 @@ def health():
 # -------------------------------
 # Local dev entrypoint
 # -------------------------------
-if _name_ == "_main_":
+if __name__ == "__main__":
     # Local: python main.py
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port)
