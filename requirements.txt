@@ -5,5 +5,4 @@ beautifulsoup4
 readability-lxml
 tldextract
 python-dotenv
-lxml-html-clean
 gunicorn
