@@ -1,14 +1,28 @@
-# main.py
-import os, re, json, asyncio
-import httpx
+import os
+import re
+import json
+import time
+import requests
 from typing import List, Dict
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from bs4 import BeautifulSoup
 from readability import Document
 import tldextract
 
-SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+# Optional local .env support (safe to keep)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "").strip())
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*").strip()
 
 USER_AGENT = (
@@ -17,155 +31,247 @@ USER_AGENT = (
     "Chrome/124.0 Safari/537.36"
 )
 
-def clean_text(txt: str) -> str:
-    txt = re.sub(r"\s+", " ", (txt or "")).strip()
-    return txt[:300]
+# ──────────────────────────────────────────────────────────────────────────────
+# App bootstrap
+# ──────────────────────────────────────────────────────────────────────────────
+app = Flask(_name_)
+CORS(
+    app,
+    resources={r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else ""}},
+    supports_credentials=False,
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def clean_text(text: str) -> str:
+    """Collapse whitespace, trim, and cap to ~300 chars for our excerpts."""
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    return text[:300]
 
 def root_domain(url: str) -> str:
     ext = tldextract.extract(url)
-    return ".".join(p for p in [ext.domain, ext.suffix] if p)
+    return ".".join([ext.domain, ext.suffix]) if ext.suffix else ext.domain
 
-def domain_logo(url_or_domain: str) -> str:
-    d = url_or_domain
-    if d.startswith("http"):
-        d = root_domain(d)
-    return f"https://www.google.com/s2/favicons?sz=64&domain={d}"
+def domain_logo(url: str) -> str:
+    return f"https://www.google.com/s2/favicons?sz=64&domain={root_domain(url)}"
 
-def make_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        headers={"User-Agent": USER_AGENT},
-        follow_redirects=True,
-        timeout=httpx.Timeout(20.0, connect=10.0)
-    )
+def retry_sleep(i: int):
+    # gentle backoff (seconds)
+    delays = [0.2, 0.5, 1.0, 1.5, 2.0]
+    time.sleep(delays[min(i, len(delays)-1)])
 
-async def fetch_excerpt(client: httpx.AsyncClient, url: str) -> str:
-    # Try page → readability → first non-trivial paragraph → fallback meta description
-    try:
-        r = await client.get(url)
-        r.raise_for_status()
-        html_raw = r.text
+def fetch_excerpt(url: str, timeout: int = 12) -> str:
+    """
+    Pull a readable first-good paragraph from the URL using readability-lxml + BeautifulSoup.
+    Tolerant to 40x/50x and TLS errors; will retry a few times and return "" on failure.
+    """
+    for i in range(3):
         try:
-            doc = Document(html_raw)
-            html = doc.summary() or html_raw
+            r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+            r.raise_for_status()
+
+            # Use Readability to isolate main content
+            doc = Document(r.text)
+            html = doc.summary() or r.text
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Prefer non-trivial paragraph
+            for p in soup.select("p"):
+                line = clean_text(p.get_text())
+                if len(line) > 60:
+                    return line
+
+            # Fallback: meta description
+            m = soup.find("meta", attrs={"name": "description"})
+            if m and m.get("content"):
+                return clean_text(m["content"])
+            return ""
         except Exception:
-            html = html_raw
-        soup = BeautifulSoup(html, "html.parser")
-
-        for p in soup.select("p"):
-            line = clean_text(p.get_text(" ", strip=True))
-            if len(line) > 60:
-                return line
-
-        m = soup.find("meta", attrs={"name": "description"})
-        if m and m.get("content"):
-            return clean_text(m["content"])
-
-    except Exception:
-        pass
+            retry_sleep(i)
     return ""
 
-app = FastAPI(title="TFC Reviews API")
+def clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[""] if ALLOWED_ORIGIN == "" else [ALLOWED_ORIGIN],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenAI link finder
+# ──────────────────────────────────────────────────────────────────────────────
+def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
+    """
+    Ask OpenAI to return up to n review links for the given topic.
+    Returns a list of dicts: [{"url": "...", "name": "..."}]
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY")
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+    n = clamp(n, 1, 20)
+    system = (
+        "You are a web research assistant. Given a topic, return high-quality, "
+        "editorial review links (articles or blog reviews) about that topic. "
+        "Avoid homepages, category hubs, booking engines, social media, and forums. "
+        "Prefer established magazines, newspapers, specialist blogs, and guides. "
+        "Output strict JSON only with the schema: "
+        '{ "links": [ { "url": "https://...", "name": "Site or Article Title" } ] } '
+        f"Return at most {n} items."
+    )
+    user = f"Topic: {topic}\nReturn up to {n} review links as per schema."
 
-@app.get("/reviews")
-async def reviews(title: str = Query(..., min_length=2), n: int = Query(6, ge=1, le=20)):
-    if not SERPER_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing SERPER_API_KEY")
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENAI_CHAT_MODEL,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "response_format": {"type": "json_object"},
+        },
+        timeout=45,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
-    payload = {"q": f"{title} review", "num": max(10, n * 3)}
-    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+    content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+        .strip()
+    )
 
-    results: List[Dict] = []
+    # Be defensive: if model drifts from JSON, catch it neatly
+    try:
+        parsed = json.loads(content or "{}")
+        links = parsed.get("links", [])
+    except json.JSONDecodeError:
+        raise RuntimeError("ChatGPT returned invalid JSON. Try a more popular topic.")
+
+    out = []
+    for it in links:
+        url = (it.get("url") or "").strip()
+        name = (it.get("name") or "").strip()
+        if url:
+            out.append({"url": url, "name": name or url})
+    return out[:n]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# API
+# ──────────────────────────────────────────────────────────────────────────────
+@app.route("/reviews")
+def reviews():
+    """
+    Build review cards by topic using OpenAI to propose links, then fetch
+    logo + excerpt for each link.
+
+    Query:
+      - title=Eiffel Tower
+      - n=10         (optional, default 10, max 20)
+    """
+    title = (request.args.get("title") or "").strip()
+    try:
+        n = int(request.args.get("n", 10))
+    except Exception:
+        n = 10
+    n = clamp(n, 1, 20)
+
+    if not title:
+        return jsonify({"error": "Missing title"}), 400
+
+    try:
+        candidates = ask_openai_for_links(title, n * 2)  # over-ask; we dedupe/filter
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    results = []
     seen = set()
 
-    async with make_client() as client:
-        try:
-            resp = await client.post("https://google.serper.dev/search", headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Serper fetch failed: {e}")
+    for it in candidates:
+        url = it.get("url")
+        name = it.get("name") or url
+        if not url:
+            continue
 
-        for item in data.get("organic", []):
-            url = (item.get("link") or "").strip()
-            name = (item.get("title") or url).strip()
-            if not url:
-                continue
+        root = root_domain(url)
+        if root in seen:  # de-duplicate by site root
+            continue
 
-            r = root_domain(url)
-            if not r or r in seen:
-                continue
+        excerpt = fetch_excerpt(url)
+        if not excerpt:
+            continue
 
-            excerpt = await fetch_excerpt(client, url)
-            if not excerpt:
-                continue
-
-            results.append({
+        results.append(
+            {
                 "url": url,
                 "name": name,
                 "excerpt": excerpt,
                 "logo": domain_logo(url),
-                "score": ""
-            })
-            seen.add(r)
-            if len(results) >= n:
-                break
+                "score": "",
+            }
+        )
+        seen.add(root)
 
-    return {"title": title, "items": results}
+        if len(results) >= n:
+            break
 
-@app.get("/review-url")
-async def review_url(url: str = Query(..., min_length=8)):
-    # Build one review card from a direct URL
-    async with make_client() as client:
-        try:
-            r = await client.get(url)
-            r.raise_for_status()
-            html_raw = r.text
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"URL fetch failed: {e}")
+    return jsonify({"title": title, "items": results})
 
-        try:
-            doc = Document(html_raw)
-            html = doc.summary() or html_raw
-        except Exception:
-            html = html_raw
+@app.route("/review-url")
+def review_url():
+    """
+    Build a single review card from a direct URL.
 
+    Query:
+      - url=https://example.com/some-review
+    """
+    url = (request.args.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "Missing url"}), 400
+
+    try:
+        r = requests.get(url, timeout=12, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+
+        doc = Document(r.text)
+        html = doc.summary() or r.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # site/article name
+        # derive a site/article name
         name = ""
         if soup.title and soup.title.string:
             name = clean_text(soup.title.string)
         if not name:
-            name = root_domain(url) or url
+            name = root_domain(url)
 
-        # excerpt
         excerpt = ""
         for p in soup.select("p"):
-            line = clean_text(p.get_text(" ", strip=True))
+            line = clean_text(p.get_text())
             if len(line) > 60:
                 excerpt = line
                 break
-        if not excerpt:
-            m = soup.find("meta", attrs={"name": "description"})
-            if m and m.get("content"):
-                excerpt = clean_text(m["content"])
 
-        return {
-            "url": url,
-            "name": name,
-            "excerpt": excerpt,
-            "logo": domain_logo(url),
-            "score": ""
-        }
+        return jsonify(
+            {
+                "url": url,
+                "name": name,
+                "excerpt": excerpt,
+                "logo": domain_logo(url),
+                "score": "",
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": f"URL fetch failed: {e}"}), 500
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True})
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Local dev entrypoint (Render ignores this block)
+# ──────────────────────────────────────────────────────────────────────────────
+if _name_ == "_main_":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
