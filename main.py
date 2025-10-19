@@ -36,12 +36,10 @@ USER_AGENT = (
 app = Flask(__name__)
 CORS(
     app,
-    resources={
-        r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else "*"},
-        r"/reviews": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else "*"},
-        r"/review-url": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else "*"},
-        r"/health": {"origins": "*"},
-    },
+    resources={r"/": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else "*"},
+               r"/reviews": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else "*"},
+               r"/review-url": {"origins": ALLOWED_ORIGIN if ALLOWED_ORIGIN else "*"},
+               r"/health": {"origins": "*"}}
 )
 
 # -------------------------------
@@ -49,6 +47,7 @@ CORS(
 # -------------------------------
 
 def clean_text(text: str) -> str:
+    """Collapse whitespace, trim, and cap to ~300 chars for our excerpts."""
     text = re.sub(r"\s+", " ", (text or "")).strip()
     return text[:300]
 
@@ -60,6 +59,10 @@ def domain_logo(url: str) -> str:
     return f"https://www.google.com/s2/favicons?sz=64&domain={root_domain(url)}"
 
 def fetch_excerpt(url: str, timeout: int = 12) -> str:
+    """
+    Pull a readable first-good paragraph from the URL using readability-lxml + BeautifulSoup.
+    Returns "" on failure. Never raises to the caller.
+    """
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
@@ -67,38 +70,52 @@ def fetch_excerpt(url: str, timeout: int = 12) -> str:
         return ""
 
     try:
+        # Use Readability to isolate main content
         doc = Document(r.text)
         html = doc.summary() or r.text
         soup = BeautifulSoup(html, "html.parser")
+
+        # Prefer non-trivial paragraph
         for p in soup.select("p"):
             line = clean_text(p.get_text())
             if len(line) > 60:
                 return line
+
+        # Fallback: meta description
         m = soup.find("meta", attrs={"name": "description"})
         if m and m.get("content"):
             return clean_text(m["content"])
     except Exception:
         pass
+
     return ""
 
 def clamp(n: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 # -------------------------------
-# OpenAI link fetcher
+# OpenAI call
 # -------------------------------
+
 def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
+    """
+    Ask OpenAI to return up to n review links for the given topic.
+    We instruct it to output strict JSON.
+    Returns a list of dicts: [{"url": "...", "name": "..."}]
+    """
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY")
 
     n = clamp(n, 1, 20)
+
     system = (
         "You are a web research assistant. Given a topic, return high-quality, "
         "editorial review links (articles or blog reviews) about that topic. "
         "Avoid homepages, category hubs, booking engines, social media, and forums. "
         "Prefer established magazines, newspapers, specialist blogs, and guides. "
         "Output strict JSON only with the schema: "
-        '{\"links\": [{\"url\": \"https://...\", \"name\": \"Site or Article Title\"}]}."
+        '{ "links": [ { "url": "https://...", "name": "Site or Article Title" } ] }. '
+        f"Return at most {n} items."
     )
     user = f"Topic: {topic}\nReturn up to {n} review links as per schema."
 
@@ -122,16 +139,21 @@ def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
     resp.raise_for_status()
     data = resp.json()
     content = (
-        data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+        .strip()
     )
 
+    # Be defensive about JSON format
     try:
         parsed = json.loads(content or "{}")
         links = parsed.get("links", [])
     except json.JSONDecodeError:
+        # Return none; caller will handle as "no results"
         links = []
 
-    out = []
+    out: List[Dict] = []
     for it in links:
         url = (it.get("url") or "").strip()
         name = (it.get("name") or "").strip()
@@ -140,11 +162,19 @@ def ask_openai_for_links(topic: str, n: int) -> List[Dict]:
     return out[:n]
 
 # -------------------------------
-# API endpoints
+# API Endpoints
 # -------------------------------
 
 @app.route("/reviews")
 def reviews():
+    """
+    Build review cards by topic using OpenAI to propose links, then fetch
+    logo + excerpt for each link.
+
+    Query:
+      - title=Eiffel Tower
+      - n=10           (optional, default 10, max 20)
+    """
     title = (request.args.get("title") or "").strip()
     try:
         n = int(request.args.get("n", 10))
@@ -156,11 +186,12 @@ def reviews():
         return jsonify({"error": "Missing title"}), 400
 
     try:
-        candidates = ask_openai_for_links(title, n * 2)
+        candidates = ask_openai_for_links(title, n * 2)  # over-ask, we will filter/dedupe
     except Exception as e:
+        # Surface the error cleanly to the client
         return jsonify({"error": f"{e}"}), 500
 
-    results = []
+    results: List[Dict] = []
     seen_roots = set()
 
     for it in candidates:
@@ -170,7 +201,7 @@ def reviews():
             continue
 
         root = root_domain(url)
-        if root in seen_roots:
+        if root in seen_roots:  # de-duplicate sites
             continue
 
         excerpt = fetch_excerpt(url)
@@ -191,38 +222,16 @@ def reviews():
         if len(results) >= n:
             break
 
-    # --- Add automatic traveler data ---
-    low = title.lower()
-    travelers = {}
-    if "acropolis" in low:
-        travelers = {
-            "google":  {"rating": "4.7", "count": "55,737", "link": "https://maps.app.goo.gl/N4rcaL52jqEthDgG9"},
-            "trip":    {"rating": "4.6", "count": "344", "link": "https://us.trip.com/travel-guide/athens/acropolis-museum-90726/"},
-            "expedia": {"rating": "4.4", "count": "198", "link": "https://expedia.com/affiliate/ngbjOdP"}
-        }
-    elif "eiffel" in low:
-        travelers = {
-            "google":  {"rating": "4.7", "count": "109,245", "link": "https://maps.app.goo.gl/MPG4jLmvfM3HqVZm8"},
-            "trip":    {"rating": "4.6", "count": "867", "link": "https://us.trip.com/travel-guide/paris/eiffel-tower-10578390/"},
-            "expedia": {"rating": "4.5", "count": "550", "link": "https://expedia.com/affiliate/ngbjOdP"}
-        }
-    elif "colosseum" in low:
-        travelers = {
-            "google":  {"rating": "4.7", "count": "363,850", "link": "https://maps.app.goo.gl/MjPq7epCHkVwHeTAA"},
-            "trip":    {"rating": "4.5", "count": "976", "link": "https://us.trip.com/travel-guide/rome/colosseum-10112345/"},
-            "expedia": {"rating": "4.3", "count": "422", "link": "https://expedia.com/affiliate/ngbjOdP"}
-        }
-    else:
-        travelers = {
-            "google":  {"rating": "4.5", "count": "2,000+", "link": f"https://www.google.com/maps/search/{title.replace(' ', '+')}"},
-            "trip":    {"rating": "4.4", "count": "500+", "link": f"https://us.trip.com/search/?keyword={title.replace(' ', '+')}"},
-            "expedia": {"rating": "4.3", "count": "300+", "link": f"https://www.expedia.com/Search?destination={title.replace(' ', '+')}"}
-        }
-
-    return jsonify({"title": title, "items": results, "travelers": travelers})
+    return jsonify({"title": title, "items": results})
 
 @app.route("/review-url")
 def review_url():
+    """
+    Build a single review card from a direct URL.
+
+    Query:
+      - url=https://example.com/some-review
+    """
     url = (request.args.get("url") or "").strip()
     if not url:
         return jsonify({"error": "Missing url"}), 400
@@ -230,9 +239,12 @@ def review_url():
     try:
         r = requests.get(url, timeout=12, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
+
         doc = Document(r.text)
         html = doc.summary() or r.text
         soup = BeautifulSoup(html, "html.parser")
+
+        # derive a site/article name
         name = ""
         if soup.title and soup.title.string:
             name = clean_text(soup.title.string)
@@ -246,13 +258,15 @@ def review_url():
                 excerpt = line
                 break
 
-        return jsonify({
-            "url": url,
-            "name": name,
-            "excerpt": excerpt,
-            "logo": domain_logo(url),
-            "score": "",
-        })
+        return jsonify(
+            {
+                "url": url,
+                "name": name,
+                "excerpt": excerpt,
+                "logo": domain_logo(url),
+                "score": "",
+            }
+        )
     except Exception as e:
         return jsonify({"error": f"URL fetch failed: {e}"}), 500
 
@@ -260,6 +274,10 @@ def review_url():
 def health():
     return jsonify({"ok": True})
 
+# -------------------------------
+# Local dev entrypoint
+# -------------------------------
 if __name__ == "__main__":
+    # Local: python main.py
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
