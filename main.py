@@ -274,14 +274,13 @@ def review_url():
 def health():
     return jsonify({"ok": True})
 
-# -------------------------------
-# Local dev entrypoint
-# -------------------------------
-if __name__ == "__main__":
-    # Local: python main.py
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
-    @app.route("/blogs", methods=["GET"])
+# ===============================
+# NEW: Fetch Top Blog Websites
+# ===============================
+from flask import Flask, request, jsonify
+import requests, re
+
+@app.route("/blogs", methods=["GET"])
 def get_blogs():
     query = request.args.get("query", "").strip()
     limit = int(request.args.get("limit", 10))
@@ -319,7 +318,7 @@ def get_blogs():
     if not blogs:
         try:
             jina_url = f"https://r.jina.ai/http://www.google.com/search?q={query}+travel+blog"
-            txt = requests.get(jina_url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15).text
+            txt = requests.get(jina_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15).text
             urls = re.findall(r"https?://[^\s\"<>]+", txt)
             seen = set()
             for u in urls:
