@@ -281,13 +281,7 @@ if __name__ == "__main__":
     # Local: python main.py
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-    # ==============================
-# NEW: Fetch Top Blog Websites
-# ==============================
-from flask import Flask, request, jsonify
-import requests, re
-
-@app.route("/blogs", methods=["GET"])
+    @app.route("/blogs", methods=["GET"])
 def get_blogs():
     query = request.args.get("query", "").strip()
     limit = int(request.args.get("limit", 10))
@@ -300,6 +294,7 @@ def get_blogs():
         r = requests.get(ddg_url, timeout=10)
         data = r.json()
     except Exception as e:
+        print("DuckDuckGo error:", e)
         data = {}
 
     blogs = []
@@ -310,7 +305,7 @@ def get_blogs():
             if "FirstURL" not in item or "Text" not in item:
                 continue
             url = item["FirstURL"]
-            if re.search(r"(blog|travel|trip|lonelyplanet|cntraveler|fodors|timeout|matadornetwork|viator|nomadic)", url, re.I):
+            if re.search(r"(blog|travel|trip|lonelyplanet|fodors|cntraveler|timeout|matadornetwork|viator|nomadic)", url, re.I):
                 host = re.sub(r"^www\.", "", re.findall(r"https?://([^/]+)", url)[0])
                 blogs.append({
                     "logo": f"https://www.google.com/s2/favicons?domain={host}",
@@ -320,25 +315,25 @@ def get_blogs():
                     "score": ""
                 })
 
-    # 2️⃣ Fallback: Jina.ai over Google
+    # 2️⃣ Fallback if no results from DuckDuckGo
     if not blogs:
-        google_proxy = f"https://r.jina.ai/http://www.google.com/search?q={query}+travel+blog"
         try:
-            text = requests.get(google_proxy, headers={"User-Agent":"Mozilla/5.0"}, timeout=15).text
-            urls = re.findall(r"https?://[^\s\"<>]+", text)
+            jina_url = f"https://r.jina.ai/http://www.google.com/search?q={query}+travel+blog"
+            txt = requests.get(jina_url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15).text
+            urls = re.findall(r"https?://[^\s\"<>]+", txt)
             seen = set()
             for u in urls:
                 if len(blogs) >= limit:
                     break
                 if "google" in u or u in seen:
                     continue
-                if re.search(r"(blog|travel|trip|lonelyplanet|cntraveler|fodors|timeout|matadornetwork|viator|nomadic)", u, re.I):
+                if re.search(r"(blog|travel|trip|lonelyplanet|fodors|cntraveler|timeout|matadornetwork|viator|nomadic)", u, re.I):
                     seen.add(u)
                     host = re.sub(r"^www\.", "", re.findall(r"https?://([^/]+)", u)[0])
                     blogs.append({
                         "logo": f"https://www.google.com/s2/favicons?domain={host}",
                         "name": host.title(),
-                        "excerpt": f"Top travel blog about {query}",
+                        "excerpt": f"Travel blog about {query}",
                         "url": u,
                         "score": ""
                     })
@@ -346,4 +341,3 @@ def get_blogs():
             print("Fallback search error:", e)
 
     return jsonify({"items": blogs})
-
